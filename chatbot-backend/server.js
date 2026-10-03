@@ -1,40 +1,28 @@
+const crypto = require("crypto");
 const express = require("express");
 const app = express();
 
 require("dotenv").config();
-
+const { connectDB } = require("./config/db");
 const Groq = require("groq-sdk");
-
+const Conversation = require("./modals/conversation");
+const {
+  checkAvailability,
+  bookAppointment,
+} = require("./services/appointments");
+const { confirmEmail } = require("./services/confirmEmail");
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
-
+connectDB();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use("/api/slots", require("./routes/slots.route"));
+app.use("/api/appointments", require("./routes/appointment.route"));
 
 app.get("/", (req, res) => {
   res.send("backend for ai chatbot is running....");
 });
-
-// ----------------------------------
-// Available appointment slots
-// ----------------------------------
-
-const availableSlots = [
-  { date: "2026-10-02", time: "16:00" },
-  { date: "2026-10-02", time: "17:00" },
-  { date: "2026-10-03", time: "10:00" },
-];
-
-// ----------------------------------
-// Actual JavaScript function
-// ----------------------------------
-
-function checkAvailability(date, time) {
-  return availableSlots.some((slot) => {
-    return slot.date === date && slot.time === time;
-  });
-}
 
 // ----------------------------------
 // Get today's date dynamically
@@ -79,14 +67,100 @@ const tools = [
       },
     },
   },
+  {
+    type: "function",
+
+    function: {
+      name: "bookAppointment",
+
+      description:
+        "Book an appointment slot. Only call this after the user has confirmed the date and time and has given their name, phone number and email. Ask for any missing detail first.",
+
+      parameters: {
+        type: "object",
+
+        properties: {
+          name: { type: "string", description: "Customer's full name." },
+          phone: { type: "string", description: "Customer's phone number." },
+          email: { type: "string", description: "Customer's email address." },
+          date: {
+            type: "string",
+            description: "Appointment date in YYYY-MM-DD format.",
+          },
+          time: {
+            type: "string",
+            description: "Appointment time in 24-hour HH:MM format.",
+          },
+        },
+
+        required: ["name", "phone", "email", "date", "time"],
+      },
+    },
+  },
+  {
+    type: "function",
+
+    function: {
+      name: "confirmEmail",
+
+      description:
+        "Confirmation Email. Only call this after the booking is confirmed and pass date and time , name and email . ",
+
+      parameters: {
+        type: "object",
+
+        properties: {
+          name: { type: "string", description: "Customer's full name." },
+          email: { type: "string", description: "Customer's email number." },
+          date: {
+            type: "string",
+            description: "Appointment date in YYYY-MM-DD format.",
+          },
+          time: {
+            type: "string",
+            description: "Appointment time in 24-hour HH:MM format.",
+          },
+        },
+
+        required: ["name", "email", "date", "time"],
+      },
+    },
+  },
 ];
+
+// Run a tool requested by the AI and return a JSON-serialisable result
+async function runTool(name, args) {
+  if (name === "checkAvailability") {
+    const available = await checkAvailability(args.date, args.time);
+    return { available, date: args.date, time: args.time };
+  }
+
+  if (name === "bookAppointment") {
+    const result = await bookAppointment(args);
+    return result.booked
+      ? {
+          booked: true,
+          name: args.name,
+          date: args.date,
+          time: args.time,
+          confirmationEmailSent: result.emailSent,
+        }
+      : { booked: false, reason: result.reason };
+  }
+
+  return { error: `Unknown tool: ${name}` };
+}
 
 // ----------------------------------
 // Conversation history
 // ----------------------------------
 
-const chatHistory = [
-  {
+// The system prompt is rebuilt on every call (so "today" is always correct)
+// and is not stored; only the user/assistant/tool messages go to MongoDB.
+function systemMessage() {
+  const today = new Date().toISOString().split("T")[0];
+
+  return {
     role: "system",
 
     content: `
@@ -105,22 +179,38 @@ When the user asks about an appointment:
 - 4 PM = 16:00.
 - Never guess or change the user's requested date or time.
 - When the user asks about availability, use the checkAvailability tool.
+- To book, first make sure the slot is available, then collect the user's name, phone number and email, confirm, and use the bookAppointment tool.
+- A confirmation email is sent automatically when a booking succeeds. Never ask the user whether they want one; just tell them it was sent to their email if confirmationEmailSent is true, or that it could not be sent if false.
+- Never say an appointment is booked unless bookAppointment returned booked: true.
 `,
-  },
-];
+  };
+}
+
+async function loadHistory(conversationId) {
+  const conversation = await Conversation.findOne({ conversationId }).lean();
+  return conversation ? conversation.messages : [];
+}
+
+async function saveHistory(conversationId, messages) {
+  await Conversation.updateOne(
+    { conversationId },
+    { messages },
+    { upsert: true },
+  );
+}
 
 // ----------------------------------
 // Send message to Groq
 // ----------------------------------
 
-async function getGroqChatCompletion(prompt, model) {
+async function getGroqChatCompletion(chatHistory, prompt, model) {
   chatHistory.push({
     role: "user",
     content: prompt,
   });
 
   return groq.chat.completions.create({
-    messages: chatHistory,
+    messages: [systemMessage(), ...chatHistory],
     model: model,
 
     tools: tools,
@@ -137,11 +227,19 @@ app.post("/ai", async (req, res) => {
   try {
     const { prompt, model } = req.body;
 
+    // Each user/browser keeps its own sessionId; a new one is issued if missing
+    const sessionId = req.body.sessionId || crypto.randomUUID();
+    const chatHistory = await loadHistory(sessionId);
+
     // ----------------------------------
     // First AI call
     // ----------------------------------
 
-    const chatCompletion = await getGroqChatCompletion(prompt, model);
+    const chatCompletion = await getGroqChatCompletion(
+      chatHistory,
+      prompt,
+      model,
+    );
 
     const message = chatCompletion.choices[0]?.message;
 
@@ -152,51 +250,36 @@ app.post("/ai", async (req, res) => {
     // ----------------------------------
 
     if (message?.tool_calls?.length) {
-      const toolCall = message.tool_calls[0];
-
-      console.log("Tool requested:", toolCall.function.name);
-
-      // Get arguments from AI
-      const args = JSON.parse(toolCall.function.arguments);
-
-      console.log("Tool arguments:", args);
-
-      // ----------------------------------
-      // Execute our actual JavaScript function
-      // ----------------------------------
-
-      const result = checkAvailability(args.date, args.time);
-
-      console.log("Tool result:", result);
-
-      // ----------------------------------
       // Add AI's tool request to history
-      // ----------------------------------
-
       chatHistory.push(message);
 
-      // ----------------------------------
-      // Add tool result to history
-      // ----------------------------------
+      // Run every requested tool and answer each tool_call_id
+      const toolResults = [];
 
-      chatHistory.push({
-        role: "tool",
+      for (const toolCall of message.tool_calls) {
+        const args = JSON.parse(toolCall.function.arguments);
 
-        tool_call_id: toolCall.id,
+        console.log("Tool requested:", toolCall.function.name, args);
 
-        content: JSON.stringify({
-          available: result,
-          date: args.date,
-          time: args.time,
-        }),
-      });
+        const result = await runTool(toolCall.function.name, args);
+
+        console.log("Tool result:", result);
+
+        toolResults.push({ tool: toolCall.function.name, args, result });
+
+        chatHistory.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result),
+        });
+      }
 
       // ----------------------------------
       // Second AI call
       // ----------------------------------
 
       const finalCompletion = await groq.chat.completions.create({
-        messages: chatHistory,
+        messages: [systemMessage(), ...chatHistory],
 
         model: model,
 
@@ -219,14 +302,14 @@ app.post("/ai", async (req, res) => {
       // Send final response
       // ----------------------------------
 
+      await saveHistory(sessionId, chatHistory);
+
       res.json({
+        sessionId,
+
         prompt: prompt,
 
-        tool: toolCall.function.name,
-
-        arguments: args,
-
-        availability: result ? "available" : "unavailable",
+        tools: toolResults,
 
         response: finalMessage?.content || "Something went wrong😭",
 
@@ -247,7 +330,11 @@ app.post("/ai", async (req, res) => {
       content: aiResponse,
     });
 
+    await saveHistory(sessionId, chatHistory);
+
     res.json({
+      sessionId,
+
       prompt: prompt,
 
       response: aiResponse,
