@@ -10,7 +10,6 @@ const {
   checkAvailability,
   bookAppointment,
 } = require("./services/appointments");
-const { confirmEmail } = require("./services/confirmEmail");
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
